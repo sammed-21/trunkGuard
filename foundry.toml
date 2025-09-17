@@ -1,12 +1,23 @@
 [profile.default]
 src = "src"
 out = "out"
-libs = ["node_modules"]
+libs = ["node_modules", "lib"]
 ffi = false
 fs_permissions = [{ access = "read-write", path = ".forge-snapshots/"}]
 solc_version = "0.8.26"
 evm_version = "cancun"
 auto_detect_remappings = false
+remappings = [
+    "@uniswap/v4-core/=node_modules/@uniswap/v4-core/",
+"forge-std/=lib/forge-std/src/",
+"v4-periphery/=node_modules/@uniswap/v4-periphery/",
+"@fhenixprotocol/cofhe-contracts/=node_modules/@fhenixprotocol/cofhe-contracts/",
+"@fhenixprotocol/cofhe-foundry-mocks/=node_modules/cofhe-foundry-mocks/src/",
+"@openzeppelin/contracts-upgradeable/=node_modules/@openzeppelin/contracts-upgradeable/",
+"@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
+"permit2/=node_modules/@uniswap/v4-periphery/lib/permit2/",
+"solmate/=node_modules/@uniswap/v4-core/lib/solmate/",
+]
 
 
 # See more config options https://github.com/foundry-rs/foundry/tree/master/config
