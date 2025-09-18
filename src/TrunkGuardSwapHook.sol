@@ -10,19 +10,22 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 
 // FHE Imports
-import {FHE, InEuint128, euint128, ebool} from "@fhenixprotocol/cofhe-contracts/FHE.sol";
+import {FHE, InEuint128, euint128, ebool, Common} from "@fhenixprotocol/cofhe-contracts/FHE.sol";
 
 contract TrunkGuardSwapHook is BaseHook {
     using PoolIdLibrary for PoolKey;
-    using FHE for uint256;
+    using FHE for *;
     using BeforeSwapDeltaLibrary for BeforeSwapDelta;
+    using StateLibrary for IPoolManager;
 
-    // Store encrypted orders and outputs
+    // Store encrypted orders, validations, and outputs
     mapping(PoolId => mapping(bytes32 => euint128)) public encryptedOrders;
     mapping(PoolId => mapping(bytes32 => euint128)) public encryptedMinOutputs;
     mapping(PoolId => mapping(bytes32 => euint128)) public encryptedOutputs;
+    mapping(PoolId => mapping(bytes32 => ebool)) public swapValidations;
 
     // Events for Hackathon demo
     event SwapSubmitted(
@@ -64,13 +67,22 @@ contract TrunkGuardSwapHook is BaseHook {
             });
     }
 
-    // Submit encrypted swap
+    // Submit encrypted swap (store only; actual swap is performed by caller/test router)
     function submitEncryptedSwap(
         PoolKey calldata key,
         euint128 encryptedAmount,
         euint128 encryptedMinOutput,
-        bytes calldata hookData
+        bytes calldata /*hookData*/
     ) external {
+        require(
+            Common.isInitialized(encryptedAmount),
+            "Encrypted amount not initialized"
+        );
+        require(
+            Common.isInitialized(encryptedMinOutput),
+            "Encrypted min output not initialized"
+        );
+
         bytes32 orderHash = keccak256(
             abi.encode(msg.sender, key, encryptedAmount)
         );
@@ -81,17 +93,10 @@ contract TrunkGuardSwapHook is BaseHook {
         FHE.allowThis(encryptedOrders[poolId][orderHash]);
         FHE.allowThis(encryptedMinOutputs[poolId][orderHash]);
 
-        // Trigger swap
-        SwapParams memory params = SwapParams({
-            zeroForOne: true, // Token0 -> Token1
-            amountSpecified: int256(uint256(FHE.decrypt(encryptedAmount))), // Decrypt for PoolManager
-            sqrtPriceLimitX96: 0
-        });
         emit SwapSubmitted(msg.sender, orderHash, poolId);
-        poolManager.swap(key, params, hookData);
     }
 
-    function beforeSwap(
+    function _beforeSwap(
         address sender,
         PoolKey calldata key,
         SwapParams calldata params,
@@ -105,19 +110,30 @@ contract TrunkGuardSwapHook is BaseHook {
         // Get encrypted order data
         euint128 encryptedAmount = encryptedOrders[poolId][orderHash];
         euint128 encryptedMinOutput = encryptedMinOutputs[poolId][orderHash];
+        require(
+            Common.isInitialized(encryptedAmount),
+            "Encrypted amount not initialized"
+        );
+        require(
+            Common.isInitialized(encryptedMinOutput),
+            "Encrypted min output not initialized"
+        );
 
-        // Get current pool price (simplified; use TWAP for production)
-        (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(key);
-        euint128 encCurrentPrice = FHE.asEuint128(uint256(sqrtPriceX96));
+        // Get current pool price (scaled to fit euint128)
+        (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(key.toId());
+        uint128 scaledPrice = uint128(uint256(sqrtPriceX96) >> 32); // Scale down for euint128
+        euint128 encCurrentPrice = FHE.asEuint128(scaledPrice);
 
         // Homomorphic check: output >= minOutput
-        euint128 expectedOutput = encryptedAmount.mul(encCurrentPrice);
-        ebool isValid = expectedOutput.ge(encryptedMinOutput);
-        require(FHE.decrypt(isValid), "Private min output not met");
+        euint128 expectedOutput = FHE.mul(encryptedAmount, encCurrentPrice);
+        ebool isValid = FHE.gte(expectedOutput, encryptedMinOutput);
+        swapValidations[poolId][orderHash] = isValid;
+        // request decryption of validation result
+        FHE.decrypt(isValid);
 
-        // Clear order after validation
-        delete encryptedOrders[poolId][orderHash];
-        delete encryptedMinOutputs[poolId][orderHash];
+        // Clear order after validation by zeroing the ciphertexts
+        encryptedOrders[poolId][orderHash] = FHE.asEuint128(0);
+        encryptedMinOutputs[poolId][orderHash] = FHE.asEuint128(0);
 
         return (
             BaseHook.beforeSwap.selector,
@@ -126,7 +142,7 @@ contract TrunkGuardSwapHook is BaseHook {
         );
     }
 
-    function afterSwap(
+    function _afterSwap(
         address sender,
         PoolKey calldata key,
         SwapParams calldata params,
@@ -138,8 +154,16 @@ contract TrunkGuardSwapHook is BaseHook {
             abi.encode(sender, key, params.amountSpecified)
         );
 
-        // Store encrypted output
-        euint128 encOutput = FHE.asEuint128(uint256(delta.amount1()));
+        // Store encrypted absolute output amount
+        int256 amount1Signed = int256(delta.amount1());
+        uint256 outputAmount = amount1Signed < 0
+            ? uint256(-amount1Signed)
+            : uint256(amount1Signed);
+        require(
+            outputAmount <= type(uint128).max,
+            "Output exceeds euint128 limit"
+        );
+        euint128 encOutput = FHE.asEuint128(outputAmount);
         encryptedOutputs[poolId][orderHash] = encOutput;
         FHE.allowThis(encryptedOutputs[poolId][orderHash]);
 
@@ -153,8 +177,9 @@ contract TrunkGuardSwapHook is BaseHook {
     ) external {
         PoolId poolId = key.toId();
         euint128 encOutput = encryptedOutputs[poolId][orderHash];
-        require(FHE.decrypt(encOutput) > 0, "No output to decrypt");
-        FHE.decrypt(encOutput); // Request decryption
+        require(Common.isInitialized(encOutput), "No output to decrypt");
+        // request decryption task
+        FHE.decrypt(encOutput);
         emit OutputDecryptionRequested(orderHash, poolId);
     }
 
@@ -162,13 +187,27 @@ contract TrunkGuardSwapHook is BaseHook {
     function revealOutput(PoolKey calldata key, bytes32 orderHash) external {
         PoolId poolId = key.toId();
         euint128 encOutput = encryptedOutputs[poolId][orderHash];
+        require(Common.isInitialized(encOutput), "No output to reveal");
         (uint128 outputAmount, bool isReady) = FHE.getDecryptResultSafe(
             encOutput
         );
         require(isReady, "Output not yet decrypted");
+        require(outputAmount > 0, "No output available");
 
-        delete encryptedOutputs[poolId][orderHash];
+        encryptedOutputs[poolId][orderHash] = FHE.asEuint128(0);
         emit OutputRevealed(orderHash, poolId, outputAmount);
         // Transfer logic (e.g., FHERC20) can be added here
+    }
+
+    // Validate swap result (called separately to check homomorphic validation)
+    function validateSwap(PoolKey calldata key, bytes32 orderHash) external {
+        PoolId poolId = key.toId();
+        ebool isValid = swapValidations[poolId][orderHash];
+        require(Common.isInitialized(isValid), "Validation not initialized");
+        (bool result, bool isReady) = FHE.getDecryptResultSafe(isValid);
+        require(isReady, "Validation not yet decrypted");
+        require(result, "Swap validation failed");
+        // clear validation flag
+        swapValidations[poolId][orderHash] = FHE.asEbool(false);
     }
 }
