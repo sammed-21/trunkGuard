@@ -1,319 +1,168 @@
-# TrunkGuardHook 🔒🦄
+## TrunkGuard: FHE-Powered Uniswap v4 Hook
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Solidity](https://img.shields.io/badge/Solidity-0.8.19+-blue.svg)](https://soliditylang.org/)
-[![Uniswap v4](https://img.shields.io/badge/Uniswap-v4-ff007a.svg)](https://github.com/Uniswap/v4-core)
-[![Fhenix](https://img.shields.io/badge/Fhenix-FHE-9b59b6.svg)](https://www.fhenix.io/)
+Private, MEV-resistant swaps on Uniswap v4 using Fhenix Fully Homomorphic Encryption (FHE).
 
-**Confidential Swaps & On-Chain Dark Pool with Fhenix FHE + Uniswap v4 Hooks**
-
-A revolutionary Uniswap v4 Hook leveraging **Fhenix Fully Homomorphic Encryption (FHE)** to enable **confidential swaps** and **private derivative liquidity pools**, protecting traders and liquidity providers from MEV attacks and impermanent loss.
+This repo contains a Uniswap v4 hook that validates encrypted orders and records encrypted outputs, plus a simple FHE-enabled ERC20 used in tests and scripts.
 
 ---
 
-## 🚀 What is TrunkGuardHook?
+### What’s integrated
 
-TrunkGuardHook is a cutting-edge Uniswap v4 hook that integrates Fhenix's Fully Homomorphic Encryption (FHE) to deliver **privacy-preserving DeFi solutions**. It empowers traders and liquidity providers with:
-
-### Core Features
-
-- ✅ **Encrypted Swaps** - Trade sizes remain hidden during `beforeSwap` and `afterSwap` to prevent front-running
-- ✅ **Dark Pool Functionality** - LPs can provide liquidity for derivative tokens with concealed exposure
-- ✅ **Optional Directional Fees** - Reward LPs for taking asymmetric risk
-- ✅ **Programmable Bonding Curve** _(Future Work)_ - Custom liquidity dynamics for derivative markets
-
-> **Note:** This submission showcases a **Minimum Viable Product (MVP)** focused on confidential swaps and dark pool functionality.
+- Uniswap v4 hooks via `BaseHook` in `src/TrunkGuardSwapHook.sol`
+- Fhenix CoFHE contracts via `@fhenixprotocol/cofhe-contracts/FHE.sol`
+- Foundry-based tests with CoFHE mocks via `cofhe-foundry-mocks`
 
 ---
 
-## 🔑 Why It Matters
+## Where Fhenix is used (and how)
 
-| Problem                | Solution                                                                                              |
-| ---------------------- | ----------------------------------------------------------------------------------------------------- |
-| **MEV Attacks**        | Encrypted swap amounts prevent bots from exploiting trade sizes via front-running or sandwich attacks |
-| **LP Exposure**        | Dark pool mode ensures LPs' positions are private, reducing impermanent loss risks                    |
-| **Derivative Privacy** | Enables secure, on-chain derivative markets with hidden exposure for LPs and traders                  |
+Files:
+
+- `src/TrunkGuardSwapHook.sol`
+
+  - Imports: `import {FHE, euint128, ebool, Common} from "@fhenixprotocol/cofhe-contracts/FHE.sol";`
+  - Stores encrypted inputs/outputs per pool and order:
+    - `mapping(PoolId => mapping(bytes32 => euint128)) public encryptedOrders;`
+    - `mapping(PoolId => mapping(bytes32 => euint128)) public encryptedMinOutputs;`
+    - `mapping(PoolId => mapping(bytes32 => euint128)) public encryptedOutputs;`
+    - `mapping(PoolId => mapping(bytes32 => ebool))    public swapValidations;`
+  - Accepts encrypted inputs via:
+    - `submitEncryptedSwap(PoolKey key, euint128 encAmount, euint128 encMinOutput, bytes data)`
+  - Validates homomorphically inside `_beforeSwap`:
+    - Computes expected output with `FHE.mul(encAmount, encPrice)`
+    - Compares via `FHE.gte(expectedOutput, encMinOutput)` to produce an `ebool`
+  - Records `BalanceDelta` in `_afterSwap` (as encrypted output)
+  - Off-chain decryption flow helpers:
+    - `validateSwap`, `requestOutputDecryption`, `revealOutput`
+
+- `src/HybridFHERC20.sol`
+  - Example token used in tests/scripts; standard ERC20-like interface with helper mints
+
+Key concepts:
+
+- `euint128`, `ebool` are encrypted integer/boolean types
+- Use `Common.isInitialized(x)` to check if encrypted values are set
+- Use `FHE.asEuint128(value)` to create encrypted constants on-chain
 
 ---
 
-## ⚙️ How It Works
+## Where Uniswap v4 is used (and how)
 
-### Architecture Overview
+Files:
 
-```mermaid
-graph TD
-    A[User Initiates Swap] --> B[beforeSwap Hook]
-    B --> C[Encrypt amountSpecified with FHE]
-    C --> D[Store Encrypted Intent]
-    D --> E[Execute Swap]
-    E --> F[afterSwap Hook]
-    F --> G[Encrypt BalanceDelta]
-    G --> H[Store Encrypted Output]
-    H --> I[Settlement Ready]
+- `src/TrunkGuardSwapHook.sol`
+
+  - Inherits `BaseHook` and implements:
+    - `_beforeSwap(…) internal override returns (bytes4, BeforeSwapDelta, uint24)`
+    - `_afterSwap(…)  internal override returns (bytes4, int128)`
+  - Reads pool state via `IPoolManager` and `StateLibrary` (e.g. `getSlot0(key.toId())`)
+
+- Tests and setup use v4-core helpers via `test/utils` and Foundry fixtures.
+
+Hook address permissions:
+
+- Uniswap v4 encodes permissions in the least-significant 14 bits of the hook’s address (see `@uniswap/v4-core/src/libraries/Hooks.sol`).
+- For this hook we require at minimum:
+  - `Hooks.BEFORE_SWAP_FLAG`
+  - `Hooks.AFTER_SWAP_FLAG`
+  - optionally `Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG` if returning deltas
+
+Deploying to a valid address (tests):
+
+- Use `HookMiner.find` from `v4-periphery` to generate a CREATE2 salt that yields an address with the proper flags.
+- Example (see comments in `test/TrunkGuardSwapHook.t.sol`):
+  - `(address hookAddress, bytes32 salt) = HookMiner.find(deployer, flags, type(TrunkGuardSwapHook).creationCode, abi.encode(manager));`
+  - `new TrunkGuardSwapHook{salt: salt}(manager)` and assert `address(hook) == hookAddress`
+
+Troubleshooting `SenderNotAllowed` / `HookAddressNotValid`:
+
+- These revert when the hook address does not encode the required flags
+- Always deploy the hook to an address returned by `HookMiner.find`
+- Ensure you pass the same constructor args to both `find` and `new … {salt: …}`
+
+---
+
+## Project layout
+
+```
+trunkGuard/
+├─ src/
+│  ├─ TrunkGuardSwapHook.sol        # Main FHE-enabled Uniswap v4 hook
+│  ├─ HybridFHERC20.sol             # Simple token used for local tests/scripts
+│  └─ interface/
+│     └─ IFHERC20.sol
+├─ test/
+│  ├─ TrunkGuardSwapHook.t.sol      # Core tests (Foundry + CoFHE mocks)
+│  └─ utils/…                       # Uniswap v4 testing utilities
+├─ script/
+│  ├─ 01_CreatePoolAndMintLiquidity.s.sol
+│  ├─ 01a_CreatePoolOnly.s.sol
+│  ├─ 02_AddLiquidity.s.sol
+│  ├─ 03_Swap.s.sol                 # Simple swap script
+│  └─ Anvil.s.sol                   # Local end-to-end demo
+├─ foundry.toml
+├─ hardhat.config.ts
+└─ remappings.txt
 ```
 
-### Hook Lifecycle
-
-#### `beforeSwap()`
-
-- Encrypts the swap input amount (`amountSpecified`) using Fhenix FHE
-- Stores the encrypted swap intent in the hook for privacy
-- Prevents MEV bots from seeing trade sizes
-
-#### `afterSwap()`
-
-- Encrypts the actual output received (`BalanceDelta`)
-- Records it privately for secure settlement or auditing
-- Maintains end-to-end encryption
-
-#### Encrypted Storage
-
-- Swap inputs and outputs are stored per pool and user in encrypted form
-- Only authorized accounts (pool owner, LP managers) can decrypt values for settlement
-- Enables private derivative position management
-
-#### Dark Pool Mode
-
-- Swap sizes are completely hidden from public view
-- LPs benefit from privacy-preserved settlements
-- Secure liquidity provision without position exposure
-
 ---
 
-## ⚡ Quickstart
+## Quickstart (local)
 
-### Prerequisites
+Prereqs:
 
-Before you begin, ensure you have the following installed:
+- Foundry (forge, anvil)
+- Node.js (for installing packages if needed)
 
-- **[Foundry (Forge)](https://book.getfoundry.sh/)** - For smart contract development and testing
-- **[Node.js](https://nodejs.org/)** (v16+) - For dependency management
-- **[Anvil](https://book.getfoundry.sh/anvil/)** - For running a local Ethereum development chain
-
-### Installation
+Install and build:
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/trunkguardhook.git
-cd trunkguardhook
-
-# Install dependencies
-npm install
-
-# Install Foundry dependencies
-forge install
-
-# Build contracts
+pnpm install || npm install
 forge build
-
-# Run tests
-forge test --via-ir -v
 ```
 
-### Local Development
-
-#### 1. Start Local Chain
+Run tests:
 
 ```bash
-# Start Anvil with increased gas limit for FHE operations
-anvil --gas-limit 30000000
+forge test -vv
 ```
 
-#### 2. Deploy & Demo
+Run local demo on Anvil:
 
 ```bash
-# Deploy the hook, pool, and perform encrypted swap demo
-forge script script/Anvil.s.sol \
-    --rpc-url http://localhost:8545 \
-    --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-    --broadcast \
-    --via-ir
-```
-
-#### 3. Verify Deployment
-
-```bash
-# Check deployment logs for contract addresses
-# Interact with deployed contracts using cast commands
-```
-
----
-
-## 📂 Project Structure
-
-```plaintext
-trunkguardhook/
-├── src/
-│   ├── TrunkGuardHook.sol          # Main FHE-enabled Uniswap v4 hook
-│   ├── interfaces/
-│   │   └── ITrunkGuardHook.sol     # Hook interface definition
-│   └── libraries/
-│       └── FHEUtils.sol            # Fhenix FHE utility functions
-├── test/
-│   ├── TrunkGuardHook.t.sol        # Core hook functionality tests
-│   ├── integration/
-│   │   └── DarkPool.t.sol          # Dark pool integration tests
-│   └── mocks/
-│       └── MockFHE.sol             # Mock FHE for testing
-├── script/
-│   ├── Anvil.s.sol                 # Local deployment script
-│   ├── Deploy.s.sol                # Production deployment script
-│   └── Demo.s.sol                  # Interactive demo script
-├── docs/
-│   ├── ARCHITECTURE.md             # Technical architecture details
-│   └── API.md                      # API documentation
-└── README.md                       # This file
-```
-
----
-
-## 🧪 Demo Flow
-
-### Step-by-Step Walkthrough
-
-#### 1. **Pool Setup**
-
-```solidity
-// Deploy a Uniswap v4 pool with TrunkGuardHook enabled
-PoolKey memory poolKey = PoolKey({
-    currency0: currency0,
-    currency1: currency1,
-    fee: 3000,
-    tickSpacing: 60,
-    hooks: IHooks(address(trunkGuardHook))
-});
-```
-
-#### 2. **Provide Liquidity**
-
-```solidity
-// Add liquidity with FHE protection
-modifyLiquidity(poolKey, liquidityParams, ZERO_BYTES);
-```
-
-#### 3. **Execute Encrypted Swap**
-
-```solidity
-// Perform swap with encrypted amounts
-SwapParams memory params = SwapParams({
-    zeroForOne: true,
-    amountSpecified: encryptedAmount, // FHE encrypted
-    sqrtPriceLimitX96: 0
-});
-swap(poolKey, params, testSettings, ZERO_BYTES);
-```
-
-#### 4. **Retrieve Encrypted Data**
-
-```solidity
-// View encrypted swap details (authorized accounts only)
-bytes memory encryptedSwap = trunkGuardHook.getEncryptedSwap(poolId, user);
-```
-
-#### 5. **Settlement Process**
-
-```solidity
-// Decrypt for final settlement (permissioned)
-uint256 decryptedAmount = trunkGuardHook.decryptSwap(poolId, user);
-```
-
----
-
-## 🏗️ Technical Architecture
-
-### FHE Integration
-
-- **Encryption**: All swap amounts encrypted using Fhenix FHE before processing
-- **Storage**: Encrypted data stored in mapping structures with pool and user keys
-- **Access Control**: Only authorized parties can decrypt sensitive trading data
-- **Gas Optimization**: Efficient FHE operations to minimize transaction costs
-
-### Security Model
-
-- **Privacy**: Trade sizes and LP positions hidden from public view
-- **Access Control**: Role-based permissions for decryption operations
-- **MEV Protection**: Front-running and sandwich attacks prevented by design
-- **Audit Trail**: Encrypted records maintain compliance capabilities
-
----
-
-## 🌟 Why Judges Should Care
-
-TrunkGuardHook represents a significant leap forward in DeFi infrastructure by combining **Fhenix FHE** with **Uniswap v4 hooks**:
-
-### Innovation Impact
-
-| Aspect                 | Innovation                                             |
-| ---------------------- | ------------------------------------------------------ |
-| **Privacy Revolution** | First implementation of FHE in AMM swaps               |
-| **MEV Mitigation**     | Novel approach to protecting traders from exploitation |
-| **LP Protection**      | Reduces impermanent loss through position privacy      |
-| **Scalable Design**    | Extensible architecture for future DeFi primitives     |
-
-### Technical Excellence
-
-- ✨ **Clean Architecture** - Modular, testable, and maintainable codebase
-- ✨ **Gas Efficient** - Optimized FHE operations for practical deployment
-- ✨ **Comprehensive Testing** - Full test suite with integration scenarios
-- ✨ **Production Ready** - Complete deployment and demo infrastructure
-
-### Real-World Application
-
-- 📊 **Institutional Trading** - Dark pool functionality for large trades
-- 📊 **Retail Protection** - MEV-resistant swaps for everyday users
-- 📊 **Derivative Markets** - Private position management for complex instruments
-- 📊 **Cross-Chain Privacy** - Foundation for multi-chain confidential DeFi
-
----
-
-## 🚀 Getting Started
-
-Ready to explore confidential DeFi? Follow these steps:
-
-1. **Clone & Install** - Set up the development environment
-2. **Run Tests** - Verify all functionality works correctly
-3. **Deploy Locally** - Spin up your own encrypted trading pool
-4. **Execute Swaps** - Experience MEV-resistant trading firsthand
-5. **Explore Code** - Dive into the FHE integration details
-
-### Quick Commands
-
-```bash
-# Complete setup and demo in one command
-git clone https://github.com/yourusername/trunkguardhook.git && \
-cd trunkguardhook && \
-npm install && \
-forge install && \
-forge test --via-ir && \
 anvil --gas-limit 30000000 &
-forge script script/Anvil.s.sol --rpc-url http://localhost:8545 --broadcast --via-ir
+forge script script/Anvil.s.sol \
+  --rpc-url http://localhost:8545 \
+  --broadcast
+```
+
+Swap-only demo:
+
+```bash
+forge script script/03_Swap.s.sol \
+  --rpc-url http://localhost:8545 \
+  --broadcast
 ```
 
 ---
 
-## 📞 Support & Contact
+## Notes on tests
 
-- **Issues** - [GitHub Issues](https://github.com/yourusername/trunkguardhook/issues)
-- **Discussions** - [GitHub Discussions](https://github.com/yourusername/trunkguardhook/discussions)
-- **Documentation** - [Technical Docs](./docs/ARCHITECTURE.md)
-- **API Reference** - [API Documentation](./docs/API.md)
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+- Tests inherit `CoFheTest` from `cofhe-foundry-mocks` to simulate FHE flows
+- You may mock decryption results via the mock task manager helpers if needed
+- If you see `SenderNotAllowed` or `HookAddressNotValid` during pool init:
+  - Switch to `HookMiner.find` deployment flow in `setUp()` and re-run
 
 ---
 
-## 🙏 Acknowledgments
+## Extending this repo
 
-- **Fhenix Team** - For pioneering FHE infrastructure
-- **Uniswap Labs** - For the revolutionary v4 hooks architecture
-- **Ethereum Community** - For supporting privacy-preserving DeFi innovation
+- Add richer validation logic in `_beforeSwap`
+- Extend `revealOutput` to emit decrypted outputs after authorized reveal
+- Expand scripts to demonstrate multi-pool scenarios
 
 ---
 
-**Explore the code, run the demo, and see how TrunkGuardHook unlocks confidential DeFi!** 🚀
+## License
 
-_Built with ❤️ for the future of private, secure decentralized finance._
+MIT. See `LICENSE`.
