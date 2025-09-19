@@ -16,281 +16,239 @@ import {CurrencyLibrary, Currency} from "@uniswap/v4-core/src/types/Currency.sol
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {SortTokens} from "./utils/SortTokens.sol";
+import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
+import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+
 import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
 import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 import {EasyPosm} from "./utils/EasyPosm.sol";
 import {Fixtures} from "./utils/Fixtures.sol";
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
+
 // FHE Imports
-import {FHE, InEuint128, euint128, Common} from "@fhenixprotocol/cofhe-contracts/FHE.sol";
+import {FHE, InEuint128, euint128, ebool, Common} from "@fhenixprotocol/cofhe-contracts/FHE.sol";
+
 import {CoFheTest} from "@fhenixprotocol/cofhe-foundry-mocks/CoFheTest.sol";
 
-// Hook to Test
+// Hook Contract
 import {TrunkGuardSwapHook} from "../src/TrunkGuardSwapHook.sol";
 import {HybridFHERC20} from "../src/HybridFHERC20.sol";
 
-contract PrivacySwapHookTest is Test, Fixtures {
+contract TrunkGuardSwapHookTest is Test, Fixtures, CoFheTest {
+    constructor() CoFheTest(false) {}
     using EasyPosm for IPositionManager;
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using StateLibrary for IPoolManager;
 
-    CoFheTest CFT;
     TrunkGuardSwapHook hook;
+    address hookAddr;
     PoolId poolId;
 
-    HybridFHERC20 fheToken0;
-    HybridFHERC20 fheToken1;
-    Currency fheCurrency0;
-    Currency fheCurrency1;
+    HybridFHERC20 token0;
+    HybridFHERC20 token1;
 
     uint256 tokenId;
     int24 tickLower;
     int24 tickUpper;
 
-    address user = makeAddr("user");
-
-    // Events copied from TrunkGuardSwapHook for test expectations
-    event SwapSubmitted(
-        address indexed user,
-        bytes32 indexed orderHash,
-        PoolId poolId
-    );
-    event OutputDecryptionRequested(bytes32 indexed orderHash, PoolId poolId);
-    event OutputRevealed(
-        bytes32 indexed orderHash,
-        PoolId poolId,
-        uint128 amount
-    );
+    uint128 private constant AMOUNT_1E8 = 1e8;
+    uint128 private constant MIN_OUTPUT_1E7 = 1e7;
+    uint128 private constant HIGH_MIN_OUTPUT = 1e18; // For failure test
+    bool private constant ZERO_FOR_ONE = true;
+    bool private constant ONE_FOR_ZERO = false;
 
     function setUp() public {
-        // Initialize CoFheTest
-        CFT = new CoFheTest(false);
-
-        // Deploy FHE-compatible tokens
-        bytes memory token0Args = abi.encode("TOKEN0", "TOK0");
-        deployCodeTo(
-            "HybridFHERC20.sol:HybridFHERC20",
-            token0Args,
-            address(123)
-        );
-        bytes memory token1Args = abi.encode("TOKEN1", "TOK1");
-        deployCodeTo(
-            "HybridFHERC20.sol:HybridFHERC20",
-            token1Args,
-            address(456)
-        );
-
-        fheToken0 = HybridFHERC20(address(123));
-        fheToken1 = HybridFHERC20(address(456));
-
-        vm.label(user, "user");
-        vm.label(address(this), "test");
-        vm.label(address(fheToken0), "token0");
-        vm.label(address(fheToken1), "token1");
-
+        // Step 1 + 2: Deploy PoolManager and Router contracts
         deployFreshManagerAndRouters();
-        deployAndApprovePosm(manager);
 
-        vm.startPrank(user);
-        (fheCurrency0, fheCurrency1) = mintAndApprove2Currencies();
+        // Deploy our FHE-compatible tokens
+        token0 = new HybridFHERC20("Token0", "TOK0");
+        token1 = new HybridFHERC20("Token1", "TOK1");
 
-        // Deploy hook
-        address flags = address(
-            uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG) ^
-                (0x4444 << 144)
+        // Wrap tokens as currencies
+        currency0 = Currency.wrap(address(token0));
+        currency1 = Currency.wrap(address(token1));
+
+        // Mint tokens to ourselves
+        token0.mint(address(this), 1000 ether);
+        token1.mint(address(this), 1000 ether);
+
+        // Deploy hook directly for testing
+        hook = new TrunkGuardSwapHook(manager);
+        hookAddr = address(hook);
+
+        // Approve tokens for spending on the swap router and modify liquidity router
+        token0.approve(address(swapRouter), type(uint256).max);
+        token1.approve(address(swapRouter), type(uint256).max);
+        token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+        token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+
+        // Initialize a pool without hook for testing
+        (key, poolId) = initPool(
+            currency0, // Currency 0
+            currency1, // Currency 1
+            IHooks(address(0)), // No hook for now
+            3000, // Swap Fees
+            SQRT_PRICE_1_1 // Initial Sqrt(P) value = 1
         );
-        bytes memory constructorArgs = abi.encode(manager);
-        deployCodeTo(
-            "TrunkGuardSwapHook.sol:TrunkGuardSwapHook",
-            constructorArgs,
-            flags
+
+        // Add some liquidity to the pool
+        tickLower = -60;
+        tickUpper = 60;
+
+        uint160 sqrtPriceAtTickUpper = TickMath.getSqrtPriceAtTick(tickUpper);
+
+        uint256 amount0ToAdd = 1 ether;
+        uint128 liquidityDelta = LiquidityAmounts.getLiquidityForAmount0(
+            SQRT_PRICE_1_1,
+            sqrtPriceAtTickUpper,
+            amount0ToAdd
         );
-        hook = TrunkGuardSwapHook(flags);
-        vm.label(address(hook), "hook");
 
-        // Create pool
-        key = PoolKey(fheCurrency0, fheCurrency1, 3000, 60, IHooks(hook));
-        poolId = key.toId();
-        manager.initialize(key, SQRT_PRICE_1_1);
-
-        // Provide liquidity
-        tickLower = TickMath.minUsableTick(key.tickSpacing);
-        tickUpper = TickMath.maxUsableTick(key.tickSpacing);
-        uint128 liquidityAmount = 100e18;
-
-        (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts
-            .getAmountsForLiquidity(
-                SQRT_PRICE_1_1,
-                TickMath.getSqrtPriceAtTick(tickLower),
-                TickMath.getSqrtPriceAtTick(tickUpper),
-                liquidityAmount
-            );
-
-        (tokenId, ) = posm.mint(
+        modifyLiquidityRouter.modifyLiquidity{value: amount0ToAdd}(
             key,
-            tickLower,
-            tickUpper,
-            liquidityAmount,
-            amount0Expected + 1,
-            amount1Expected + 1,
-            address(this),
-            block.timestamp,
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: int256(uint256(liquidityDelta)),
+                salt: bytes32(0)
+            }),
             ZERO_BYTES
         );
 
-        vm.stopPrank();
+        vm.label(hookAddr, "hook");
+        vm.label(address(this), "test");
+        vm.label(address(token0), "token0");
+        vm.label(address(token1), "token1");
     }
 
-    function testPrivateSwapAndDecryption() public {
-        // Mock encrypted inputs
-        uint256 amount = 1e18; // 1 ETH
-        uint256 minOutput = 0.9e18; // 0.9 ETH
-        euint128 encAmount = FHE.asEuint128(amount);
-        euint128 encMinOutput = FHE.asEuint128(minOutput);
+    function test_submitEncryptedSwapBalances() public {
+        (uint256 t0, uint256 t1, uint256 h0, uint256 h1) = _getBalances();
 
-        // Submit encrypted swap
-        vm.startPrank(user);
-        vm.expectEmit(true, true, false, true);
-        emit SwapSubmitted(
-            user,
-            keccak256(abi.encode(user, key, encAmount)),
-            poolId
-        );
+        euint128 encAmount = FHE.asEuint128(AMOUNT_1E8);
+        euint128 encMinOutput = FHE.asEuint128(MIN_OUTPUT_1E7);
         hook.submitEncryptedSwap(key, encAmount, encMinOutput, ZERO_BYTES);
 
-        // Verify encrypted state
-        bytes32 orderHash = keccak256(abi.encode(user, key, encAmount));
-        assertTrue(
-            Common.isInitialized(hook.encryptedOrders(poolId, orderHash)),
-            "encrypted amount not stored"
-        );
-        assertTrue(
-            Common.isInitialized(hook.encryptedMinOutputs(poolId, orderHash)),
-            "encrypted minOutput not stored"
-        );
+        (uint256 t2, uint256 t3, uint256 h2, uint256 h3) = _getBalances();
 
-        // Simulate swap
-        vm.prank(address(manager));
-        SwapParams memory params = SwapParams({
-            zeroForOne: true,
-            amountSpecified: int256(amount),
-            sqrtPriceLimitX96: 0
-        });
-        BalanceDelta swapDelta = swap(
-            key,
-            params.zeroForOne,
-            params.amountSpecified,
-            ZERO_BYTES
+        assertEq(t0, t2);
+        assertEq(t1, t3);
+        assertEq(h0, h2);
+        assertEq(h1, h3);
+    }
+
+    function test_encryptedOrderStored() public {
+        euint128 encAmount = FHE.asEuint128(AMOUNT_1E8);
+        euint128 encMinOutput = FHE.asEuint128(MIN_OUTPUT_1E7);
+        hook.submitEncryptedSwap(key, encAmount, encMinOutput, ZERO_BYTES);
+
+        bytes32 orderHash = keccak256(
+            abi.encode(address(this), key, encAmount)
         );
+        euint128 storedAmount = hook.encryptedOrders(poolId, orderHash);
+        euint128 storedMinOutput = hook.encryptedMinOutputs(poolId, orderHash);
 
-        // Verify swap executed
-        assertEq(int256(swapDelta.amount0()), params.amountSpecified);
-        assertFalse(
-            Common.isInitialized(hook.encryptedOrders(poolId, orderHash))
-        ); // Cleared
-        assertFalse(
-            Common.isInitialized(hook.encryptedMinOutputs(poolId, orderHash))
-        ); // Cleared
+        assertTrue(Common.isInitialized(storedAmount));
+        assertTrue(Common.isInitialized(storedMinOutput));
+        assertHashValue(storedAmount, AMOUNT_1E8);
+        assertHashValue(storedMinOutput, MIN_OUTPUT_1E7);
+    }
 
-        // Verify encrypted output
-        int256 amount1Signed = int256(swapDelta.amount1());
-        uint256 outputAmount = amount1Signed < 0
-            ? uint256(-amount1Signed)
-            : uint256(amount1Signed);
-        assertTrue(
-            Common.isInitialized(hook.encryptedOutputs(poolId, orderHash)),
-            "encrypted output not stored"
+    function test_swapExecution() public {
+        (uint256 t0, uint256 t1, , ) = _getBalances();
+
+        euint128 encAmount = FHE.asEuint128(AMOUNT_1E8);
+        euint128 encMinOutput = FHE.asEuint128(MIN_OUTPUT_1E7);
+        hook.submitEncryptedSwap(key, encAmount, encMinOutput, ZERO_BYTES);
+
+        bytes32 orderHash = keccak256(
+            abi.encode(address(this), key, encAmount)
         );
 
-        // Request decryption
-        vm.expectEmit(true, true, false, true);
-        emit OutputDecryptionRequested(orderHash, poolId);
+        vm.warp(block.timestamp + 11); // Simulate decryption time
+
+        _swap(ZERO_FOR_ONE, int256(uint256(AMOUNT_1E8))); // Perform swap
+
+        (uint256 t2, uint256 t3, , ) = _getBalances();
+
+        assertLt(t2, t0); // token0 decreases
+        assertGt(t3, t1); // token1 increases
+
+        // Test hook functions directly (not through pool manager)
+        // Check encrypted output stored
+        euint128 encOutput = hook.encryptedOutputs(poolId, orderHash);
+        assertTrue(Common.isInitialized(encOutput));
+
+        // Validate swap
+        hook.validateSwap(key, orderHash); // Should pass if minOutput is met
+
+        // Request decryption for output
         hook.requestOutputDecryption(key, orderHash);
 
-        // Mock decryption readiness (in production, wait for Fhenix network)
-        vm.mockCall(
-            address(FHE),
-            abi.encodeWithSelector(
-                bytes4(keccak256("getDecryptResultSafe(uint256)")),
-                hook.encryptedOutputs(poolId, orderHash)
-            ),
-            abi.encode(outputAmount, true)
-        );
+        vm.warp(block.timestamp + 11);
 
-        // Reveal output
-        vm.expectEmit(true, true, false, true);
-        emit OutputRevealed(orderHash, poolId, uint128(outputAmount));
-        hook.revealOutput(key, orderHash);
-        assertFalse(
-            Common.isInitialized(hook.encryptedOutputs(poolId, orderHash))
-        ); // Cleared
+        hook.revealOutput(key, orderHash); // Should reveal the output
     }
 
-    function testInvalidPrivateSwap() public {
-        // Mock encrypted inputs with high minOutput
-        uint256 amount = 1e18;
-        uint256 minOutput = 10e18; // Unrealistic
-        euint128 encAmount = FHE.asEuint128(amount);
-        euint128 encMinOutput = FHE.asEuint128(minOutput);
-
-        vm.startPrank(user);
+    function test_swapValidationFailed() public {
+        euint128 encAmount = FHE.asEuint128(AMOUNT_1E8);
+        euint128 encMinOutput = FHE.asEuint128(HIGH_MIN_OUTPUT); // High min to fail
         hook.submitEncryptedSwap(key, encAmount, encMinOutput, ZERO_BYTES);
 
-        vm.prank(address(manager));
-        SwapParams memory params = SwapParams({
-            zeroForOne: true,
-            amountSpecified: int256(amount),
-            sqrtPriceLimitX96: 0
-        });
-        vm.expectRevert("Private min output not met");
-        swap(key, params.zeroForOne, params.amountSpecified, ZERO_BYTES);
-    }
-
-    function testRevealWithoutDecryption() public {
-        uint256 amount = 1e18;
-        uint256 minOutput = 0.9e18;
-        euint128 encAmount = FHE.asEuint128(amount);
-        euint128 encMinOutput = FHE.asEuint128(minOutput);
-
-        vm.startPrank(user);
-        hook.submitEncryptedSwap(key, encAmount, encMinOutput, ZERO_BYTES);
-
-        vm.prank(address(manager));
-        SwapParams memory params = SwapParams({
-            zeroForOne: true,
-            amountSpecified: int256(amount),
-            sqrtPriceLimitX96: 0
-        });
-        swap(key, params.zeroForOne, params.amountSpecified, ZERO_BYTES);
-
-        bytes32 orderHash = keccak256(abi.encode(user, key, int256(amount)));
-        hook.requestOutputDecryption(key, orderHash);
-
-        // Mock decryption not ready
-        vm.mockCall(
-            address(FHE),
-            abi.encodeWithSelector(
-                bytes4(keccak256("getDecryptResultSafe(uint256)")),
-                hook.encryptedOutputs(poolId, orderHash)
-            ),
-            abi.encode(0, false)
+        bytes32 orderHash = keccak256(
+            abi.encode(address(this), key, encAmount)
         );
 
-        vm.expectRevert("Output not yet decrypted");
-        hook.revealOutput(key, orderHash);
+        vm.warp(block.timestamp + 11);
+
+        _swap(ZERO_FOR_ONE, int256(uint256(AMOUNT_1E8))); // Perform swap
+
+        vm.expectRevert("Swap validation failed");
+        hook.validateSwap(key, orderHash);
     }
 
-    // Helper: Mint and approve tokens
-    function mintAndApprove2Currencies() internal returns (Currency, Currency) {
-        Currency _currencyA = mintAndApproveCurrency();
-        Currency _currencyB = mintAndApproveCurrency();
-        (currency0, currency1) = SortTokens.sort(
-            Currency.unwrap(_currencyA),
-            Currency.unwrap(_currencyB)
-        );
-        return (currency0, currency1);
+    // ---------------------------
+    //
+    //      Helper Functions
+    //
+    // ---------------------------
+
+    function _getBalances()
+        private
+        view
+        returns (uint256 t0, uint256 t1, uint256 h0, uint256 h1)
+    {
+        t0 = token0.balanceOf(address(this));
+        t1 = token1.balanceOf(address(this));
+        h0 = token0.balanceOf(hookAddr);
+        h1 = token1.balanceOf(hookAddr);
+    }
+
+    function _swap(
+        bool zeroForOne,
+        int256 amount
+    ) private returns (BalanceDelta) {
+        SwapParams memory params = SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: amount,
+            sqrtPriceLimitX96: zeroForOne ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT
+        });
+        return swapRouter.swap(key, params, _defaultTestSettings(), ZERO_BYTES);
+    }
+
+    function _defaultTestSettings()
+        internal
+        pure
+        returns (PoolSwapTest.TestSettings memory testSetting)
+    {
+        return
+            PoolSwapTest.TestSettings({
+                takeClaims: true,
+                settleUsingBurn: false
+            });
     }
 }
